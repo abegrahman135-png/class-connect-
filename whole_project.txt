@@ -1,0 +1,2967 @@
+gpt-6-astra-medium
+Yes. I’m choosing a smaller, working, security-first v1, rather than presenting unfinished calling features as production-ready.
+
+What this implementation includes
+Secure teacher provisioning—no public teacher registration.
+Student enrollment using a class invitation code.
+Separate, random account recovery keys; names never authenticate users.
+Secure, HTTP-only session cookies.
+Same-origin Pages → Worker proxy, including WebSockets.
+Class creation, invitation rotation, roster, muting and removal.
+Persistent real-time class chat, typing, presence and read receipts.
+Idempotent message submission and reconnect-safe retries.
+Image, PDF and voice-note attachments in private R2.
+Teacher message deletion.
+Installable browser UI and offline application shell.
+Application-level rate limits and conservative upload budgets.
+Cloudflare deployment workflow.
+Deliberately disabled in this release: TURN, SFU, live calls, background push and student-to-student DMs. No fake call buttons or simulated push delivery. These can be added after the core is deployed and the relevant allowances are confirmed.
+
+Important: I cannot create files in your computer or run Cloudflare commands from this chat. Below is the actual source implementation, not a claim that it has already been deployed or tested.
+
+1. Project structure
+Create this structure:
+
+text
+
+classconnect/
+├── package.json
+├── .gitignore
+├── backend/
+│   ├── wrangler.toml
+│   ├── migrations/
+│   │   └── 0001_initial.sql
+│   ├── src/
+│   │   └── index.js
+│   └── test/
+│       └── validation.test.js
+├── frontend/
+│   ├── wrangler.toml
+│   ├── _worker.js
+│   ├── index.html
+│   ├── app.js
+│   ├── styles.css
+│   ├── sw.js
+│   └── manifest.webmanifest
+├── scripts/
+│   ├── provision-teacher.mjs
+│   └── make-icons.py
+└── .github/
+    └── workflows/
+        └── deploy.yml
+There is no frontend bundler. Pages serves the source files directly.
+
+2. Root configuration
+package.json
+JSON
+
+{
+  "name": "classconnect",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test backend/test/*.test.js",
+    "icons": "python3 scripts/make-icons.py",
+    "teacher": "node scripts/provision-teacher.mjs",
+    "db:local": "wrangler d1 migrations apply classconnect-db --local --config backend/wrangler.toml",
+    "db:remote": "wrangler d1 migrations apply classconnect-db --remote --config backend/wrangler.toml",
+    "dev:api": "wrangler dev --config backend/wrangler.toml",
+    "dev:web": "wrangler pages dev frontend --port 8788 --service API=classconnect-api",
+    "deploy:api": "wrangler deploy --config backend/wrangler.toml",
+    "deploy:web": "wrangler pages deploy frontend --project-name classconnect"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
+After installing dependencies, commit package-lock.json. Subsequent deployments should use that lockfile.
+
+.gitignore
+gitignore
+
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.env.*
+teacher-seed.sql
+teacher-credentials.txt
+3. Cloudflare configuration
+backend/wrangler.toml
+Replace the database ID and Pages hostname before deploying.
+
+toml
+
+name = "classconnect-api"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+
+# Reach the API through the Pages service binding, not a public workers.dev URL.
+workers_dev = false
+preview_urls = false
+
+[vars]
+APP_ORIGIN = "https://classconnect.pages.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "classconnect-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "classconnect-files"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "ClassRoom"
+
+[[durable_objects.bindings]]
+name = "GUARD"
+class_name = "BudgetGuard"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClassRoom", "BudgetGuard"]
+
+[triggers]
+crons = ["17 3 * * *"]
+For local development, create backend/.dev.vars:
+
+dotenv
+
+APP_ORIGIN=http://localhost:8788
+frontend/wrangler.toml
+toml
+
+name = "classconnect"
+pages_build_output_dir = "."
+
+compatibility_date = "2025-04-01"
+
+[[services]]
+binding = "API"
+service = "classconnect-api"
+frontend/_worker.js
+This fixes the Pages/Worker cookie problem: the browser only contacts the Pages origin.
+
+JavaScript
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (
+      url.pathname.startsWith("/api/") ||
+      url.pathname.startsWith("/ws/")
+    ) {
+      return env.API.fetch(request);
+    }
+
+    const response = await env.ASSETS.fetch(request);
+    const headers = new Headers(response.headers);
+
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.set("X-Frame-Options", "DENY");
+    headers.set(
+      "Permissions-Policy",
+      "camera=(), microphone=(self), geolocation=()"
+    );
+    headers.set(
+      "Content-Security-Policy",
+      [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "connect-src 'self'",
+        "img-src 'self' blob:",
+        "media-src 'self' blob:",
+        "worker-src 'self'",
+        "manifest-src 'self'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'"
+      ].join("; ")
+    );
+
+    if (url.pathname === "/sw.js") {
+      headers.set("Cache-Control", "no-cache");
+    }
+
+    return new Response(response.body, {
+      status: response.status,
+      headers
+    });
+  }
+};
+4. Database
+backend/migrations/0001_initial.sql
+SQL
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('teacher', 'student')),
+  recovery_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX sessions_expiry ON sessions(expires_at);
+CREATE INDEX sessions_user ON sessions(user_id);
+
+CREATE TABLE classes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  teacher_id TEXT NOT NULL REFERENCES users(id),
+  join_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE class_members (
+  class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  joined_at INTEGER NOT NULL,
+  muted INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+  last_read_seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (class_id, user_id)
+);
+
+CREATE INDEX memberships_user ON class_members(user_id, class_id);
+
+CREATE TABLE attachments (
+  id TEXT PRIMARY KEY,
+  class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id),
+  r2_key TEXT NOT NULL UNIQUE,
+  file_name TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX attachments_expiry ON attachments(created_at);
+
+CREATE TABLE messages (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  sender_id TEXT NOT NULL REFERENCES users(id),
+  client_id TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  attachment_id TEXT UNIQUE REFERENCES attachments(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+  UNIQUE (class_id, sender_id, client_id)
+);
+
+CREATE INDEX messages_class_seq ON messages(class_id, seq);
+CREATE INDEX messages_expiry ON messages(created_at);
+
+CREATE TABLE removed_members (
+  class_id TEXT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  removed_at INTEGER NOT NULL,
+  PRIMARY KEY (class_id, user_id)
+);
+Messages use a monotonically increasing sequence, not timestamps alone, for reliable history and read cursors.
+
+5. Backend
+backend/src/index.js
+JavaScript
+
+const SESSION_SECONDS = 7 * 24 * 60 * 60;
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+
+const ALLOWED_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+  "audio/webm",
+  "audio/ogg"
+]);
+
+const encoder = new TextEncoder();
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function fail(status, message) {
+  throw new HttpError(status, message);
+}
+
+function json(value, status = 200, extra = {}) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...extra
+    }
+  });
+}
+
+function errorResponse(error) {
+  if (!(error instanceof HttpError)) {
+    console.error("Request failed", error?.stack || error);
+  }
+
+  return json(
+    {
+      error:
+        error instanceof HttpError
+          ? error.message
+          : "Server error. Please retry."
+    },
+    error instanceof HttpError ? error.status : 500
+  );
+}
+
+export function cleanText(value, min, max, label) {
+  if (typeof value !== "string") fail(400, `${label} is required.`);
+
+  const result = value.trim();
+
+  if (result.length < min || result.length > max) {
+    fail(400, `${label} must contain ${min}–${max} characters.`);
+  }
+
+  return result;
+}
+
+export function normalizeInvite(value) {
+  return cleanText(value, 8, 100, "Invite code")
+    .replace(/[\s-]/g, "")
+    .toUpperCase();
+}
+
+export function allowedMime(value) {
+  const mime = String(value || "").split(";")[0].trim().toLowerCase();
+
+  if (!ALLOWED_MIME.has(mime)) {
+    fail(400, "Supported files: JPEG, PNG, WebP, PDF, WebM audio or Ogg audio.");
+  }
+
+  return mime;
+}
+
+function randomToken(bytes = 32) {
+  const data = crypto.getRandomValues(new Uint8Array(bytes));
+  return Array.from(data, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return Array.from(new Uint8Array(digest), byte =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+async function boundedBytes(request, limit) {
+  if (!request.body) return new Uint8Array();
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let length = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      length += value.byteLength;
+
+      if (length > limit) {
+        await reader.cancel();
+        fail(413, "Request is too large.");
+      }
+
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const output = new Uint8Array(length);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return output;
+}
+
+async function bodyJSON(request, limit = 8192) {
+  try {
+    const bytes = await boundedBytes(request, limit);
+    const value = JSON.parse(new TextDecoder().decode(bytes));
+
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      fail(400, "Expected a JSON object.");
+    }
+
+    return value;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    fail(400, "Invalid JSON.");
+  }
+}
+
+function cookieName(env) {
+  return env.APP_ORIGIN.startsWith("https:")
+    ? "__Host-classconnect"
+    : "classconnect-dev";
+}
+
+function sessionCookie(env, token, maxAge = SESSION_SECONDS) {
+  const secure = env.APP_ORIGIN.startsWith("https:") ? "; Secure" : "";
+
+  return `${cookieName(env)}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure}`;
+}
+
+function getCookie(request, name) {
+  for (const part of (request.headers.get("Cookie") || "").split(";")) {
+    const index = part.indexOf("=");
+    if (index < 0) continue;
+
+    if (part.slice(0, index).trim() === name) {
+      return part.slice(index + 1).trim();
+    }
+  }
+
+  return "";
+}
+
+async function authenticate(request, env) {
+  const token = getCookie(request, cookieName(env));
+
+  if (!/^[a-f0-9]{64}$/.test(token)) fail(401, "Please sign in.");
+
+  const tokenHash = await hash(token);
+
+  const user = await env.DB.prepare(`
+    SELECT u.id, u.display_name, u.role, s.expires_at
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND s.expires_at > ?
+  `).bind(tokenHash, Date.now()).first();
+
+  if (!user) fail(401, "Your session has expired. Please sign in.");
+
+  return { ...user, session_hash: tokenHash };
+}
+
+async function createSession(env, userId) {
+  const token = randomToken();
+  const expires = Date.now() + SESSION_SECONDS * 1000;
+
+  await env.DB.prepare(`
+    INSERT INTO sessions(token_hash, user_id, expires_at)
+    VALUES (?, ?, ?)
+  `).bind(await hash(token), userId, expires).run();
+
+  return sessionCookie(env, token);
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    display_name: user.display_name,
+    role: user.role
+  };
+}
+
+function verifyOrigin(request, env) {
+  const url = new URL(request.url);
+
+  if (url.origin !== env.APP_ORIGIN) {
+    fail(403, "Unrecognized application origin.");
+  }
+
+  const unsafe = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+  const websocket = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+
+  if (
+    (unsafe || websocket) &&
+    request.headers.get("Origin") !== env.APP_ORIGIN
+  ) {
+    fail(403, "Origin verification failed.");
+  }
+}
+
+async function membership(env, classId, userId) {
+  return env.DB.prepare(`
+    SELECT m.*, c.teacher_id, c.name
+    FROM class_members m
+    JOIN classes c ON c.id = m.class_id
+    WHERE m.class_id = ? AND m.user_id = ?
+  `).bind(classId, userId).first();
+}
+
+async function consume(env, key, limit, seconds, amount = 1) {
+  const stub = env.GUARD.get(env.GUARD.idFromName("global"));
+
+  const response = await stub.fetch("https://internal/consume", {
+    method: "POST",
+    body: JSON.stringify({ key, limit, seconds, amount })
+  });
+
+  if (!response.ok) {
+    fail(429, "Application quota reached. Please try again later.");
+  }
+}
+
+async function ipLimit(request, env, category, limit, seconds) {
+  const ip = request.headers.get("CF-Connecting-IP") || "local";
+  const identity = (await hash(ip)).slice(0, 24);
+
+  await consume(env, `ip:${category}:${identity}`, limit, seconds);
+}
+
+async function roomRequest(request, env, classId) {
+  const stub = env.ROOMS.get(env.ROOMS.idFromName(classId));
+  return stub.fetch(request);
+}
+
+function attachmentInfo(row) {
+  if (!row.attachment_id || !row.file_name) return null;
+
+  return {
+    id: row.attachment_id,
+    file_name: row.file_name,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes
+  };
+}
+
+function messageJSON(row) {
+  return {
+    seq: row.seq,
+    id: row.id,
+    class_id: row.class_id,
+    sender_id: row.sender_id,
+    sender_name: row.sender_name,
+    client_id: row.client_id,
+    content: row.deleted ? "" : row.content,
+    created_at: row.created_at,
+    deleted: Boolean(row.deleted),
+    attachment: row.deleted ? null : attachmentInfo(row)
+  };
+}
+
+const MESSAGE_SELECT = `
+  SELECT m.*, u.display_name AS sender_name,
+    a.file_name, a.mime_type, a.size_bytes
+  FROM messages m
+  JOIN users u ON u.id = m.sender_id
+  LEFT JOIN attachments a ON a.id = m.attachment_id
+`;
+
+async function loadMessage(env, id) {
+  const row = await env.DB.prepare(
+    `${MESSAGE_SELECT} WHERE m.id = ?`
+  ).bind(id).first();
+
+  return row ? messageJSON(row) : null;
+}
+
+function sniffFile(bytes, mime) {
+  const ascii = (start, length) =>
+    String.fromCharCode(...bytes.slice(start, start + length));
+
+  const valid =
+    (mime === "image/jpeg" &&
+      bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
+    (mime === "image/png" &&
+      [137, 80, 78, 71, 13, 10, 26, 10].every((b, i) => bytes[i] === b)) ||
+    (mime === "image/webp" &&
+      ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") ||
+    (mime === "application/pdf" && ascii(0, 5) === "%PDF-") ||
+    (mime === "audio/ogg" && ascii(0, 4) === "OggS") ||
+    (mime === "audio/webm" &&
+      [0x1a, 0x45, 0xdf, 0xa3].every((b, i) => bytes[i] === b));
+
+  if (!valid) fail(400, "File contents do not match its declared format.");
+}
+
+async function upload(request, env, user) {
+  const url = new URL(request.url);
+  const classId = cleanText(url.searchParams.get("class"), 1, 100, "Class");
+  const fileName = cleanText(url.searchParams.get("name"), 1, 160, "File name");
+  const size = Number(url.searchParams.get("size"));
+  const mime = allowedMime(request.headers.get("Content-Type"));
+
+  if (!Number.isInteger(size) || size < 1 || size > MAX_FILE_BYTES) {
+    fail(413, "Files must be between 1 byte and 5 MiB.");
+  }
+
+  const member = await membership(env, classId, user.id);
+  if (!member || member.muted) fail(403, "You cannot upload to this class.");
+
+  // Reservations are not refunded on failure. This is intentionally conservative.
+  await consume(env, `upload-count:${user.id}`, 10, 86400);
+  await consume(env, `upload-bytes:${user.id}`, 20 * 1024 * 1024, 86400, size);
+  await consume(env, "upload-global-day", 50 * 1024 * 1024, 86400, size);
+  await consume(env, "upload-lifetime", 512 * 1024 * 1024, 0, size);
+
+  const bytes = await boundedBytes(request, MAX_FILE_BYTES);
+  if (bytes.byteLength !== size) fail(400, "Upload size mismatch.");
+
+  sniffFile(bytes, mime);
+
+  // Recheck after reading the body in case moderation changed while uploading.
+  const current = await membership(env, classId, user.id);
+  if (!current || current.muted) fail(403, "Upload permission was revoked.");
+
+  const id = crypto.randomUUID();
+  const key = `${classId}/${id}`;
+
+  await env.FILES.put(key, bytes, {
+    httpMetadata: { contentType: mime }
+  });
+
+  try {
+    await env.DB.prepare(`
+      INSERT INTO attachments
+        (id, class_id, owner_id, r2_key, file_name, mime_type, size_bytes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id, classId, user.id, key, fileName, mime, size, Date.now()
+    ).run();
+  } catch (error) {
+    await env.FILES.delete(key);
+    throw error;
+  }
+
+  return json({ id, file_name: fileName, mime_type: mime, size_bytes: size }, 201);
+}
+
+async function download(request, env, user, attachmentId) {
+  await consume(env, `downloads:${user.id}`, 120, 3600);
+
+  const row = await env.DB.prepare(`
+    SELECT a.*
+    FROM attachments a
+    JOIN messages m ON m.attachment_id = a.id AND m.deleted = 0
+    JOIN class_members cm ON cm.class_id = a.class_id AND cm.user_id = ?
+    WHERE a.id = ?
+  `).bind(user.id, attachmentId).first();
+
+  if (!row) fail(404, "Attachment is unavailable.");
+
+  const object = await env.FILES.get(row.r2_key);
+  if (!object) fail(404, "Attachment has expired.");
+
+  const fileName = encodeURIComponent(row.file_name).replace(
+    /['()*]/g,
+    char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": row.mime_type,
+      "Content-Length": String(object.size),
+      "Content-Disposition": `attachment; filename*=UTF-8''${fileName}`,
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "sandbox"
+    }
+  });
+}
+
+async function handle(request, env) {
+  verifyOrigin(request, env);
+
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
+
+  if (path === "/api/health" && method === "GET") {
+    return json({
+      ok: true,
+      features: { push: false, calls: false, directMessages: false }
+    });
+  }
+
+  if (path === "/api/auth/login" && method === "POST") {
+    await ipLimit(request, env, "login", 20, 3600);
+
+    const body = await bodyJSON(request);
+    const key = cleanText(body.key, 64, 64, "Recovery key").toLowerCase();
+
+    if (!/^[a-f0-9]{64}$/.test(key)) fail(401, "Invalid recovery key.");
+
+    const user = await env.DB.prepare(`
+      SELECT id, display_name, role FROM users WHERE recovery_hash = ?
+    `).bind(await hash(key)).first();
+
+    if (!user) fail(401, "Invalid recovery key.");
+
+    return json(
+      { user: publicUser(user) },
+      200,
+      { "Set-Cookie": await createSession(env, user.id) }
+    );
+  }
+
+  if (path === "/api/auth/join" && method === "POST") {
+    await ipLimit(request, env, "join", 10, 3600);
+    await consume(env, "enrollments-global", 100, 86400);
+
+    const body = await bodyJSON(request);
+    const displayName = cleanText(body.name, 1, 60, "Name");
+    const inviteHash = await hash(normalizeInvite(body.code));
+
+    const classroom = await env.DB.prepare(`
+      SELECT id FROM classes WHERE join_hash = ?
+    `).bind(inviteHash).first();
+
+    if (!classroom) fail(400, "Invalid invitation code.");
+
+    const userId = crypto.randomUUID();
+    const recoveryKey = randomToken();
+
+    // Guarded INSERT prevents enrollment if the code was rotated meanwhile
+    // or the class has reached its member cap.
+    const results = await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO users(id, display_name, role, recovery_hash, created_at)
+        SELECT ?, ?, 'student', ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM classes c
+          WHERE c.id = ? AND c.join_hash = ?
+          AND (SELECT COUNT(*) FROM class_members WHERE class_id = c.id) < 41
+        )
+      `).bind(
+        userId, displayName, await hash(recoveryKey), Date.now(),
+        classroom.id, inviteHash
+      ),
+      env.DB.prepare(`
+        INSERT INTO class_members(class_id, user_id, joined_at)
+        SELECT ?, id, ? FROM users WHERE id = ?
+      `).bind(classroom.id, Date.now(), userId)
+    ]);
+
+    if (!results[0].meta.changes) {
+      fail(409, "Invitation changed or the class is full.");
+    }
+
+    return json(
+      {
+        user: { id: userId, display_name: displayName, role: "student" },
+        recoveryKey
+      },
+      201,
+      { "Set-Cookie": await createSession(env, userId) }
+    );
+  }
+
+  const user = await authenticate(request, env);
+
+  if (path === "/api/auth/logout" && method === "POST") {
+    await env.DB.prepare(
+      "DELETE FROM sessions WHERE token_hash = ?"
+    ).bind(user.session_hash).run();
+
+    return json(
+      { ok: true },
+      200,
+      { "Set-Cookie": sessionCookie(env, "", 0) }
+    );
+  }
+
+  if (path === "/api/me" && method === "GET") {
+    return json({ user: publicUser(user) });
+  }
+
+  if (path === "/api/classes" && method === "GET") {
+    const result = await env.DB.prepare(`
+      SELECT c.id, c.name, c.teacher_id, cm.muted, cm.last_read_seq
+      FROM classes c
+      JOIN class_members cm ON cm.class_id = c.id
+      WHERE cm.user_id = ?
+      ORDER BY c.created_at
+    `).bind(user.id).all();
+
+    return json({ classes: result.results });
+  }
+
+  if (path === "/api/classes" && method === "POST") {
+    if (user.role !== "teacher") fail(403, "Only teachers can create classes.");
+
+    await consume(env, `class-create:${user.id}`, 10, 86400);
+
+    const body = await bodyJSON(request);
+    const name = cleanText(body.name, 1, 80, "Class name");
+    const classId = crypto.randomUUID();
+    const code = randomToken(10).toUpperCase();
+
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO classes(id, name, teacher_id, join_hash, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(classId, name, user.id, await hash(code), Date.now()),
+      env.DB.prepare(`
+        INSERT INTO class_members(class_id, user_id, joined_at)
+        VALUES (?, ?, ?)
+      `).bind(classId, user.id, Date.now())
+    ]);
+
+    return json({ id: classId, name, code }, 201);
+  }
+
+  if (path === "/api/classes/join" && method === "POST") {
+    await consume(env, `join-existing:${user.id}`, 10, 3600);
+
+    const body = await bodyJSON(request);
+    const codeHash = await hash(normalizeInvite(body.code));
+
+    const classroom = await env.DB.prepare(
+      "SELECT id FROM classes WHERE join_hash = ?"
+    ).bind(codeHash).first();
+
+    if (!classroom) fail(400, "Invalid invitation code.");
+
+    const result = await env.DB.prepare(`
+      INSERT OR IGNORE INTO class_members(class_id, user_id, joined_at)
+      SELECT c.id, ?, ? FROM classes c
+      WHERE c.id = ? AND c.join_hash = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM removed_members WHERE class_id = c.id AND user_id = ?
+      )
+      AND (SELECT COUNT(*) FROM class_members WHERE class_id = c.id) < 41
+    `).bind(user.id, Date.now(), classroom.id, codeHash, user.id).run();
+
+    if (!result.meta.changes && !(await membership(env, classroom.id, user.id))) {
+      fail(403, "You cannot join this class.");
+    }
+
+    return json({ id: classroom.id });
+  }
+
+  const ws = path.match(/^\/ws\/classes\/([a-f0-9-]+)$/);
+  if (ws && method === "GET") {
+    await consume(env, `connect:${user.id}`, 60, 3600);
+    return roomRequest(request, env, ws[1]);
+  }
+
+  const room = path.match(
+    /^\/api\/classes\/([a-f0-9-]+)\/(roster|invite|members|messages)(?:\/([a-f0-9-]+))?$/
+  );
+
+  if (room) {
+    await consume(env, `room-api:${user.id}`, 240, 3600);
+    return roomRequest(request, env, room[1]);
+  }
+
+  if (path === "/api/uploads" && method === "POST") {
+    return upload(request, env, user);
+  }
+
+  const file = path.match(/^\/api\/files\/([a-f0-9-]+)$/);
+  if (file && method === "GET") {
+    return download(request, env, user, file[1]);
+  }
+
+  fail(404, "Not found.");
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(cleanup(env));
+  }
+};
+
+async function cleanup(env) {
+  const day = 86400000;
+  const now = Date.now();
+
+  // At most 100 object removals per run.
+  const stale = await env.DB.prepare(`
+    SELECT a.id, a.r2_key
+    FROM attachments a
+    WHERE a.created_at < ?
+       OR (
+         a.created_at < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM messages m
+           WHERE m.attachment_id = a.id AND m.deleted = 0
+         )
+       )
+    ORDER BY a.created_at
+    LIMIT 100
+  `).bind(now - 30 * day, now - day).all();
+
+  for (const item of stale.results) {
+    await env.FILES.delete(item.r2_key);
+    await env.DB.prepare("DELETE FROM attachments WHERE id = ?")
+      .bind(item.id).run();
+  }
+
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now),
+    env.DB.prepare("DELETE FROM messages WHERE created_at < ?")
+      .bind(now - 30 * day)
+  ]);
+}
+
+/**
+ * Private, SQLite-backed quota coordinator.
+ * Persistent counters survive Durable Object hibernation/restarts.
+ */
+export class BudgetGuard {
+  constructor(ctx) {
+    this.ctx = ctx;
+
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS counters (
+        key TEXT PRIMARY KEY,
+        used INTEGER NOT NULL,
+        expires INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS counters_expiry ON counters(expires);
+    `);
+  }
+
+  async fetch(request) {
+    const { key, limit, seconds, amount } = await request.json();
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+
+    sql.exec("DELETE FROM counters WHERE expires > 0 AND expires <= ?", now);
+
+    const row = [...sql.exec(
+      "SELECT used FROM counters WHERE key = ?", key
+    )][0];
+
+    if ((row?.used || 0) + amount > limit) {
+      return new Response("Quota exceeded", { status: 429 });
+    }
+
+    sql.exec(`
+      INSERT INTO counters(key, used, expires) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET used = used + excluded.used
+    `, key, amount, seconds ? now + seconds * 1000 : 0);
+
+    return new Response("OK");
+  }
+}
+
+/**
+ * One SQLite-backed, hibernating Durable Object per class.
+ */
+export class ClassRoom {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.queue = Promise.resolve();
+
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS rate_limits (
+        user_id TEXT PRIMARY KEY,
+        started INTEGER NOT NULL,
+        count INTEGER NOT NULL
+      );
+    `);
+  }
+
+  serial(work) {
+    const result = this.queue.then(work);
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
+  send(socket, value) {
+    try {
+      socket.send(JSON.stringify(value));
+    } catch {
+      try { socket.close(1011, "Connection error"); } catch {}
+    }
+  }
+
+  broadcast(value) {
+    for (const socket of this.ctx.getWebSockets()) {
+      this.send(socket, value);
+    }
+  }
+
+  presence() {
+    const users = new Set();
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const auth = socket.deserializeAttachment();
+      if (auth?.expires_at > Date.now()) users.add(auth.id);
+    }
+
+    this.broadcast({ type: "presence", userIds: [...users] });
+  }
+
+  rateLimit(userId) {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const row = [...sql.exec(
+      "SELECT started, count FROM rate_limits WHERE user_id = ?", userId
+    )][0];
+
+    if (!row || now - row.started >= 60000) {
+      sql.exec(`
+        INSERT INTO rate_limits(user_id, started, count) VALUES (?, ?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET started = excluded.started, count = 1
+      `, userId, now);
+      return;
+    }
+
+    if (row.count >= 90) fail(429, "Too many events. Wait a minute.");
+    sql.exec("UPDATE rate_limits SET count = count + 1 WHERE user_id = ?", userId);
+  }
+
+  async fetch(request) {
+    try {
+      return await this.serial(() => this.route(request));
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  async route(request) {
+    const url = new URL(request.url);
+    const user = await authenticate(request, this.env);
+    const match = url.pathname.match(/\/classes\/([a-f0-9-]+)/);
+    const classId = match?.[1];
+
+    const member = await membership(this.env, classId, user.id);
+    if (!member) fail(403, "You are not a member of this class.");
+
+    if (url.pathname.startsWith("/ws/")) {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        fail(426, "WebSocket required.");
+      }
+
+      const sockets = this.ctx.getWebSockets();
+      if (sockets.length >= 82) fail(429, "Class connection limit reached.");
+
+      const ownSockets = sockets.filter(
+        socket => socket.deserializeAttachment()?.id === user.id
+      );
+
+      if (ownSockets.length >= 2) {
+        ownSockets[0].close(4001, "Opened on another tab or device.");
+      }
+
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+
+      this.ctx.acceptWebSocket(server);
+      server.serializeAttachment({
+        id: user.id,
+        display_name: user.display_name,
+        session_hash: user.session_hash,
+        expires_at: user.expires_at,
+        classId
+      });
+
+      this.send(server, { type: "ready" });
+      this.presence();
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    const suffix = url.pathname.split(`/classes/${classId}/`)[1];
+    const [resource, targetId] = suffix.split("/");
+    const method = request.method;
+
+    if (resource === "roster" && method === "GET") {
+      const result = await this.env.DB.prepare(`
+        SELECT u.id, u.display_name, u.role, cm.muted, cm.last_read_seq
+        FROM class_members cm
+        JOIN users u ON u.id = cm.user_id
+        WHERE cm.class_id = ?
+        ORDER BY u.role DESC, u.display_name
+      `).bind(classId).all();
+
+      return json({ members: result.results });
+    }
+
+    if (resource === "messages" && method === "GET") {
+      const afterValue = url.searchParams.get("after");
+      const beforeValue = url.searchParams.get("before");
+      let query;
+      let args;
+
+      if (afterValue !== null) {
+        const after = Number(afterValue);
+        if (!Number.isSafeInteger(after) || after < 0) fail(400, "Invalid cursor.");
+
+        query = `${MESSAGE_SELECT}
+          WHERE m.class_id = ? AND m.seq > ?
+          ORDER BY m.seq ASC LIMIT 100`;
+        args = [classId, after];
+      } else if (beforeValue !== null) {
+        const before = Number(beforeValue);
+        if (!Number.isSafeInteger(before) || before < 1) fail(400, "Invalid cursor.");
+
+        query = `${MESSAGE_SELECT}
+          WHERE m.class_id = ? AND m.seq < ?
+          ORDER BY m.seq DESC LIMIT 100`;
+        args = [classId, before];
+      } else {
+        query = `${MESSAGE_SELECT}
+          WHERE m.class_id = ? ORDER BY m.seq DESC LIMIT 100`;
+        args = [classId];
+      }
+
+      const result = await this.env.DB.prepare(query).bind(...args).all();
+      const messages = result.results.map(messageJSON);
+
+      if (afterValue === null) messages.reverse();
+
+      return json({ messages });
+    }
+
+    if (member.teacher_id !== user.id) {
+      fail(403, "Only the class teacher can perform this action.");
+    }
+
+    if (resource === "invite" && method === "POST") {
+      const code = randomToken(10).toUpperCase();
+
+      await this.env.DB.prepare(
+        "UPDATE classes SET join_hash = ? WHERE id = ?"
+      ).bind(await hash(code), classId).run();
+
+      return json({ code });
+    }
+
+    if (resource === "members" && targetId && method === "PATCH") {
+      if (targetId === user.id) fail(400, "You cannot mute yourself.");
+
+      const body = await bodyJSON(request);
+      if (typeof body.muted !== "boolean") fail(400, "Invalid mute value.");
+
+      await this.env.DB.prepare(`
+        UPDATE class_members SET muted = ?
+        WHERE class_id = ? AND user_id = ?
+      `).bind(body.muted ? 1 : 0, classId, targetId).run();
+
+      this.broadcast({ type: "roster:changed" });
+      return json({ ok: true });
+    }
+
+    if (resource === "members" && targetId && method === "DELETE") {
+      if (targetId === user.id) fail(400, "You cannot remove yourself.");
+
+      // Removing someone rotates the shared invitation as well.
+      const code = randomToken(10).toUpperCase();
+
+      await this.env.DB.batch([
+        this.env.DB.prepare(`
+          INSERT OR REPLACE INTO removed_members(class_id, user_id, removed_at)
+          SELECT class_id, user_id, ? FROM class_members
+          WHERE class_id = ? AND user_id = ?
+        `).bind(Date.now(), classId, targetId),
+        this.env.DB.prepare(`
+          DELETE FROM class_members WHERE class_id = ? AND user_id = ?
+        `).bind(classId, targetId),
+        this.env.DB.prepare("UPDATE classes SET join_hash = ? WHERE id = ?")
+          .bind(await hash(code), classId)
+      ]);
+
+      for (const socket of this.ctx.getWebSockets()) {
+        if (socket.deserializeAttachment()?.id === targetId) {
+          socket.close(4003, "Removed from class.");
+        }
+      }
+
+      this.broadcast({ type: "roster:changed" });
+      this.presence();
+
+      return json({ ok: true, code });
+    }
+
+    if (resource === "messages" && targetId && method === "DELETE") {
+      await this.env.DB.prepare(`
+        UPDATE messages SET deleted = 1, content = ''
+        WHERE id = ? AND class_id = ?
+      `).bind(targetId, classId).run();
+
+      this.broadcast({ type: "message:deleted", id: targetId });
+      return json({ ok: true });
+    }
+
+    fail(404, "Not found.");
+  }
+
+  async webSocketMessage(socket, raw) {
+    return this.serial(async () => {
+      let event;
+
+      try {
+        if (typeof raw !== "string" || raw.length > 8192) {
+          fail(400, "Invalid message frame.");
+        }
+
+        event = JSON.parse(raw);
+        if (!event || typeof event !== "object") fail(400, "Invalid event.");
+
+        const auth = socket.deserializeAttachment();
+        if (!auth || auth.expires_at <= Date.now()) {
+          socket.close(4001, "Session expired.");
+          return;
+        }
+
+        this.rateLimit(auth.id);
+
+        if (event.type === "typing") {
+          this.broadcast({
+            type: "typing",
+            userId: auth.id,
+            name: auth.display_name
+          });
+          return;
+        }
+
+        // Persistent operations always revalidate both session and membership.
+        const validSession = await this.env.DB.prepare(`
+          SELECT 1 FROM sessions
+          WHERE token_hash = ? AND user_id = ? AND expires_at > ?
+        `).bind(auth.session_hash, auth.id, Date.now()).first();
+
+        if (!validSession) {
+          socket.close(4001, "Session expired.");
+          return;
+        }
+
+        const member = await membership(this.env, auth.classId, auth.id);
+        if (!member) {
+          socket.close(4003, "Class access revoked.");
+          return;
+        }
+
+        if (event.type === "message:new") {
+          if (member.muted) fail(403, "You are muted in this class.");
+
+          const clientId = cleanText(event.clientId, 1, 100, "Client ID");
+          const content = cleanText(event.content ?? "", 0, 4000, "Message");
+          const attachmentId = event.attachmentId || null;
+
+          const existing = await this.env.DB.prepare(`
+            SELECT id FROM messages
+            WHERE class_id = ? AND sender_id = ? AND client_id = ?
+          `).bind(auth.classId, auth.id, clientId).first();
+
+          if (existing) {
+            this.send(socket, {
+              type: "message:ack",
+              clientId,
+              message: await loadMessage(this.env, existing.id)
+            });
+            return;
+          }
+
+          if (!content && !attachmentId) fail(400, "Write a message or attach a file.");
+
+          if (attachmentId) {
+            const attachment = await this.env.DB.prepare(`
+              SELECT id FROM attachments
+              WHERE id = ? AND class_id = ? AND owner_id = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM messages WHERE attachment_id = attachments.id
+              )
+            `).bind(attachmentId, auth.classId, auth.id).first();
+
+            if (!attachment) fail(400, "Attachment is unavailable or already used.");
+          }
+
+          const id = crypto.randomUUID();
+
+          // Persistence happens BEFORE acknowledgement or broadcast.
+          await this.env.DB.prepare(`
+            INSERT INTO messages
+              (id, class_id, sender_id, client_id, content, attachment_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            id, auth.classId, auth.id, clientId, content, attachmentId, Date.now()
+          ).run();
+
+          const message = await loadMessage(this.env, id);
+
+          this.send(socket, { type: "message:ack", clientId, message });
+          this.broadcast({ type: "message:new", message });
+          return;
+        }
+
+        if (event.type === "message:read") {
+          const seq = Number(event.seq);
+          if (!Number.isSafeInteger(seq) || seq < 1) fail(400, "Invalid read cursor.");
+
+          const exists = await this.env.DB.prepare(`
+            SELECT 1 FROM messages WHERE class_id = ? AND seq = ?
+          `).bind(auth.classId, seq).first();
+
+          if (!exists) fail(400, "Unknown message.");
+
+          await this.env.DB.prepare(`
+            UPDATE class_members
+            SET last_read_seq = MAX(last_read_seq, ?)
+            WHERE class_id = ? AND user_id = ?
+          `).bind(seq, auth.classId, auth.id).run();
+
+          this.broadcast({
+            type: "message:read",
+            userId: auth.id,
+            seq: Math.max(seq, member.last_read_seq)
+          });
+          return;
+        }
+
+        fail(400, "Unsupported event.");
+      } catch (error) {
+        if (!(error instanceof HttpError)) console.error(error);
+
+        this.send(socket, {
+          type: "error",
+          clientId: event?.clientId,
+          code: error instanceof HttpError ? error.status : 500,
+          message:
+            error instanceof HttpError ? error.message : "Could not save message."
+        });
+      }
+    });
+  }
+
+  async webSocketClose(socket, code, reason) {
+    try { socket.close(code, reason); } catch {}
+    this.presence();
+  }
+
+  async webSocketError(socket) {
+    try { socket.close(1011, "Connection error"); } catch {}
+    this.presence();
+  }
+}
+Why attachments pass through the Worker here
+The original plan used direct presigned uploads. In this first release, attachments are limited to 5 MiB and uploaded through the authenticated Worker.
+
+That is a deliberate trade-off:
+
+The server can enforce the actual byte cap.
+Students cannot replay a presigned PUT URL to repeatedly overwrite an object.
+Quota reservations occur before accepting the file.
+File signatures are checked.
+There are no public R2 URLs.
+This is not antivirus scanning; PDFs and other attachments must still be treated as untrusted files.
+
+6. Frontend HTML
+frontend/index.html
+HTML
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1F3A34">
+  <meta name="description" content="Private classroom communication">
+  <title>ClassConnect</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <section id="auth" class="auth">
+    <header>
+      <span class="eyebrow">YOUR CLASSROOM, CONNECTED</span>
+      <h1>ClassConnect</h1>
+      <p>A private space for your class.</p>
+    </header>
+
+    <div class="auth-grid">
+      <form id="login-form">
+        <h2>Welcome back</h2>
+        <label>
+          Account recovery key
+          <input name="key" type="password" required
+            autocomplete="current-password" minlength="64" maxlength="64">
+        </label>
+        <button class="primary">Sign in</button>
+        <p class="muted">Your teacher account is provisioned by the school administrator.</p>
+      </form>
+
+      <form id="enroll-form">
+        <h2>First time here?</h2>
+        <label>
+          Your display name
+          <input name="name" required maxlength="60" autocomplete="nickname">
+        </label>
+        <label>
+          Class invitation code
+          <input name="code" required maxlength="100" autocomplete="off">
+        </label>
+        <button class="primary">Join class</button>
+        <p class="muted">Already have an account? Sign in first, then join another class.</p>
+      </form>
+    </div>
+  </section>
+
+  <section id="workspace" class="workspace" hidden>
+    <aside class="rail">
+      <div class="brand">ClassConnect<span>.</span></div>
+      <p id="identity"></p>
+
+      <div class="rail-actions">
+        <button id="join-class">Join another class</button>
+        <button id="create-class" hidden>Create class</button>
+      </div>
+
+      <h2 class="eyebrow">YOUR CLASSES</h2>
+      <nav id="class-list" aria-label="Classes"></nav>
+
+      <div class="rail-bottom">
+        <p>Invite-only · 30-day message retention</p>
+        <button id="logout">Sign out</button>
+      </div>
+    </aside>
+
+    <main class="conversation">
+      <header class="room-header">
+        <div>
+          <span class="eyebrow">CLASSROOM</span>
+          <h1 id="room-title">Choose a class</h1>
+        </div>
+        <span id="connection" role="status">Not connected</span>
+      </header>
+
+      <div class="transcript-controls">
+        <button id="older" disabled>Load older messages</button>
+      </div>
+
+      <section id="messages" class="messages"
+        aria-label="Class messages" tabindex="0"></section>
+
+      <div id="typing" class="typing" aria-live="polite"></div>
+      <div id="pending" class="pending" aria-live="polite"></div>
+
+      <form id="composer" class="composer">
+        <label class="sr-only" for="message-text">Message</label>
+        <textarea id="message-text" rows="3" maxlength="4000"
+          placeholder="Write to your class…" disabled></textarea>
+
+        <div id="attachment-label" class="muted"></div>
+
+        <div class="composer-toolbar">
+          <label class="file-button">
+            Attach
+            <input id="file" type="file"
+              accept="image/jpeg,image/png,image/webp,application/pdf,audio/webm,audio/ogg"
+              disabled>
+          </label>
+          <button id="record" type="button" disabled>Record voice</button>
+          <button id="cancel-attachment" type="button" hidden>Remove attachment</button>
+          <button id="send" class="primary" disabled>Send</button>
+        </div>
+      </form>
+    </main>
+
+    <aside class="context">
+      <h2>Class roster</h2>
+      <p class="muted">Only members of this class can access its messages.</p>
+      <button id="rotate-invite" hidden>Rotate invitation code</button>
+      <div id="roster"></div>
+
+      <section class="notice">
+        <strong>Privacy note</strong>
+        <p>Messages are not end-to-end encrypted. Your class teacher can moderate them.</p>
+      </section>
+    </aside>
+  </section>
+
+  <dialog id="secret-dialog">
+    <h2 id="secret-title"></h2>
+    <p id="secret-explanation"></p>
+    <textarea id="secret-value" readonly rows="3"></textarea>
+    <button id="copy-secret">Copy</button>
+    <button id="close-secret" class="primary">I have saved it</button>
+  </dialog>
+
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>
+7. Frontend application
+frontend/app.js
+JavaScript
+
+const $ = selector => document.querySelector(selector);
+
+const state = {
+  user: null,
+  classes: [],
+  room: null,
+  socket: null,
+  generation: 0,
+  retry: 0,
+  reconnectTimer: null,
+  messages: new Map(),
+  pending: new Map(),
+  roster: [],
+  online: new Set(),
+  attachment: null,
+  uploading: false,
+  recorder: null,
+  recordingStream: null,
+  recordingTimer: null,
+  lastTyping: 0,
+  lastRead: 0,
+  ready: false
+};
+
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+function button(text, action, className) {
+  const node = element("button", text, className);
+  node.type = "button";
+  node.addEventListener("click", () => run(action));
+  return node;
+}
+
+function toast(message) {
+  $("#toast").textContent = message;
+  $("#toast").hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { $("#toast").hidden = true; }, 6500);
+}
+
+async function run(work) {
+  try {
+    await work();
+  } catch (error) {
+    toast(error.message || "Something went wrong.");
+  }
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`/api${path}`, {
+    credentials: "same-origin",
+    cache: "no-store",
+    ...options,
+    headers: {
+      ...(options.body && !(options.body instanceof Blob)
+        ? { "Content-Type": "application/json" }
+        : {}),
+      ...options.headers
+    }
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
+
+  return data;
+}
+
+function post(path, body = {}) {
+  return api(path, { method: "POST", body: JSON.stringify(body) });
+}
+
+function showSecret(title, explanation, value) {
+  $("#secret-title").textContent = title;
+  $("#secret-explanation").textContent = explanation;
+  $("#secret-value").value = value;
+  $("#secret-dialog").showModal();
+}
+
+$("#copy-secret").onclick = () => run(async () => {
+  await navigator.clipboard.writeText($("#secret-value").value);
+  toast("Copied.");
+});
+
+$("#close-secret").onclick = () => {
+  $("#secret-dialog").close();
+  $("#secret-value").value = "";
+};
+
+$("#secret-dialog").addEventListener("cancel", event => event.preventDefault());
+
+$("#login-form").onsubmit = event => {
+  event.preventDefault();
+
+  run(async () => {
+    const form = new FormData(event.currentTarget);
+    const result = await post("/auth/login", { key: form.get("key") });
+    $("#login-form").reset();
+    await enter(result.user);
+  });
+};
+
+$("#enroll-form").onsubmit = event => {
+  event.preventDefault();
+
+  run(async () => {
+    const form = new FormData(event.currentTarget);
+    const result = await post("/auth/join", {
+      name: form.get("name"),
+      code: form.get("code")
+    });
+
+    $("#enroll-form").reset();
+
+    // Show the only copy before any follow-up network request can fail.
+    showSecret(
+      "Save your account recovery key",
+      "This key signs you in on another device. Store it privately. Your name and invitation code cannot recover this account.",
+      result.recoveryKey
+    );
+
+    await enter(result.user);
+  });
+};
+
+async function enter(user) {
+  state.user = user;
+  $("#auth").hidden = true;
+  $("#workspace").hidden = false;
+  $("#identity").textContent = `${user.display_name} · ${user.role}`;
+  $("#create-class").hidden = user.role !== "teacher";
+  await loadClasses();
+}
+
+async function loadClasses() {
+  const data = await api("/classes");
+  state.classes = data.classes;
+
+  const list = $("#class-list");
+  list.replaceChildren();
+
+  for (const classroom of state.classes) {
+    const node = button(classroom.name, () => openRoom(classroom), "class-tab");
+    if (state.room?.id === classroom.id) node.classList.add("selected");
+    list.append(node);
+  }
+
+  if (!state.room && state.classes.length) {
+    await openRoom(state.classes[0]);
+  }
+}
+
+$("#create-class").onclick = () => run(async () => {
+  const name = prompt("Class name");
+  if (!name?.trim()) return;
+
+  const result = await post("/classes", { name });
+
+  showSecret(
+    "Class invitation code",
+    "Share this only with your students. The server stores a hash, not the readable code.",
+    result.code
+  );
+
+  await loadClasses();
+});
+
+$("#join-class").onclick = () => run(async () => {
+  const code = prompt("Class invitation code");
+  if (!code?.trim()) return;
+
+  await post("/classes/join", { code });
+  await loadClasses();
+});
+
+function stopRecording(discard = false) {
+  if (state.recorder?.state === "recording") {
+    state.recorder.discard = discard;
+    state.recorder.stop();
+  }
+
+  clearTimeout(state.recordingTimer);
+  state.recordingStream?.getTracks().forEach(track => track.stop());
+  state.recordingStream = null;
+}
+
+$("#logout").onclick = () => run(async () => {
+  if (state.pending.size && !confirm("Unsent messages will be discarded. Sign out?")) {
+    return;
+  }
+
+  await post("/auth/logout");
+  state.generation++;
+  clearTimeout(state.reconnectTimer);
+  stopRecording(true);
+  state.socket?.close();
+  location.reload();
+});
+
+function updateComposer() {
+  const disabled = !state.room || state.uploading;
+  $("#message-text").disabled = disabled;
+  $("#file").disabled = disabled;
+  $("#record").disabled = disabled;
+  $("#send").disabled = disabled || !state.ready;
+
+  $("#attachment-label").textContent = state.uploading
+    ? "Uploading…"
+    : state.attachment
+      ? `Attached: ${state.attachment.file_name}`
+      : "";
+
+  $("#cancel-attachment").hidden = !state.attachment;
+}
+
+async function openRoom(classroom) {
+  if (state.pending.size && !confirm("Discard unsent messages and switch classes?")) {
+    return;
+  }
+
+  const generation = ++state.generation;
+  clearTimeout(state.reconnectTimer);
+  stopRecording(true);
+  state.socket?.close();
+
+  state.room = classroom;
+  state.messages.clear();
+  state.pending.clear();
+  state.roster = [];
+  state.online.clear();
+  state.attachment = null;
+  state.lastRead = 0;
+  state.ready = false;
+  state.retry = 0;
+
+  $("#message-text").value = "";
+  $("#room-title").textContent = classroom.name;
+  $("#typing").textContent = "";
+  $("#connection").textContent = "Connecting…";
+  $("#rotate-invite").hidden = classroom.teacher_id !== state.user.id;
+  $("#older").disabled = false;
+
+  updateComposer();
+  renderMessages();
+  renderPending();
+
+  for (const node of $("#class-list").children) {
+    node.classList.toggle("selected", node.textContent === classroom.name);
+  }
+
+  await refreshRoster(generation);
+  if (generation === state.generation) connect(generation);
+}
+
+async function refreshRoster(generation = state.generation) {
+  if (!state.room) return;
+
+  const data = await api(`/classes/${state.room.id}/roster`);
+  if (generation !== state.generation) return;
+
+  state.roster = data.members;
+  renderRoster();
+}
+
+function connect(generation) {
+  if (generation !== state.generation) return;
+
+  const url = new URL(`/ws/classes/${state.room.id}`, location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+
+  const socket = new WebSocket(url);
+  state.socket = socket;
+
+  socket.onmessage = event => {
+    if (generation !== state.generation) return;
+
+    run(async () => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === "ready") {
+        state.retry = 0;
+        $("#connection").textContent = "Syncing…";
+
+        // Refresh the loaded window as well as newer messages so deletions
+        // made while offline are reconciled.
+        await synchronize(generation);
+        await refreshRoster(generation);
+
+        if (generation !== state.generation) return;
+
+        state.ready = true;
+        $("#connection").textContent = "Connected";
+        updateComposer();
+
+        for (const item of state.pending.values()) transmit(item);
+        markRead();
+        return;
+      }
+
+      if (data.type === "presence") {
+        state.online = new Set(data.userIds);
+        renderRoster();
+        return;
+      }
+
+      if (data.type === "typing" && data.userId !== state.user.id) {
+        $("#typing").textContent = `${data.name} is typing…`;
+        clearTimeout(connect.typingTimer);
+        connect.typingTimer = setTimeout(() => {
+          $("#typing").textContent = "";
+        }, 5000);
+        return;
+      }
+
+      if (data.type === "message:new" || data.type === "message:ack") {
+        const message = data.message;
+        state.messages.set(message.id, message);
+
+        if (message.sender_id === state.user.id) {
+          state.pending.delete(message.client_id);
+        }
+
+        renderMessages();
+        renderPending();
+        markRead();
+        return;
+      }
+
+      if (data.type === "message:deleted") {
+        const message = state.messages.get(data.id);
+        if (message) {
+          message.deleted = true;
+          message.content = "";
+          message.attachment = null;
+          renderMessages();
+        }
+        return;
+      }
+
+      if (data.type === "message:read") {
+        const member = state.roster.find(item => item.id === data.userId);
+        if (member) member.last_read_seq = Math.max(member.last_read_seq, data.seq);
+        renderMessages();
+        return;
+      }
+
+      if (data.type === "roster:changed") {
+        await refreshRoster(generation);
+        return;
+      }
+
+      if (data.type === "error") {
+        if (data.clientId && state.pending.has(data.clientId)) {
+          const item = state.pending.get(data.clientId);
+          item.status = data.message;
+          renderPending();
+        }
+        toast(data.message);
+      }
+    });
+  };
+
+  socket.onclose = event => {
+    if (generation !== state.generation) return;
+
+    state.ready = false;
+    updateComposer();
+
+    if (event.code === 4001 || event.code === 4003) {
+      $("#connection").textContent = event.reason || "Access unavailable";
+      toast(event.reason || "Please sign in again.");
+      return;
+    }
+
+    $("#connection").textContent = "Disconnected · reconnecting";
+
+    const delay =
+      Math.min(30000, 1000 * 2 ** state.retry++) + Math.random() * 500;
+
+    state.reconnectTimer = setTimeout(() => connect(generation), delay);
+  };
+
+  socket.onerror = () => socket.close();
+}
+
+async function synchronize(generation) {
+  const existing = [...state.messages.values()];
+  let after = existing.length
+    ? Math.min(...existing.map(message => message.seq)) - 1
+    : null;
+
+  if (after === null) {
+    const data = await api(`/classes/${state.room.id}/messages`);
+    if (generation !== state.generation) return;
+
+    for (const message of data.messages) {
+      state.messages.set(message.id, message);
+      if (message.sender_id === state.user.id) {
+        state.pending.delete(message.client_id);
+      }
+    }
+  } else {
+    while (true) {
+      const data = await api(`/classes/${state.room.id}/messages?after=${after}`);
+      if (generation !== state.generation) return;
+
+      for (const message of data.messages) {
+        state.messages.set(message.id, message);
+        if (message.sender_id === state.user.id) {
+          state.pending.delete(message.client_id);
+        }
+      }
+
+      if (data.messages.length < 100) break;
+      after = data.messages.at(-1).seq;
+    }
+  }
+
+  renderMessages(true);
+  renderPending();
+}
+
+$("#older").onclick = () => run(async () => {
+  const messages = [...state.messages.values()];
+  if (!messages.length) return;
+
+  const generation = state.generation;
+  const before = Math.min(...messages.map(message => message.seq));
+  const data = await api(`/classes/${state.room.id}/messages?before=${before}`);
+
+  if (generation !== state.generation) return;
+
+  for (const message of data.messages) {
+    state.messages.set(message.id, message);
+  }
+
+  $("#older").disabled = data.messages.length < 100;
+  renderMessages(false);
+});
+
+function renderMessages(forceBottom = false) {
+  const container = $("#messages");
+  const nearBottom =
+    container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+
+  const previousTop = container.scrollTop;
+  container.replaceChildren();
+
+  const messages = [...state.messages.values()].sort((a, b) => a.seq - b.seq);
+  let previousSender = null;
+  let previousTime = 0;
+  let previousDay = "";
+
+  for (const message of messages) {
+    const date = new Date(message.created_at);
+    const day = date.toLocaleDateString();
+
+    if (day !== previousDay) {
+      container.append(element("div", day, "day-rule"));
+      previousDay = day;
+      previousSender = null;
+    }
+
+    const row = element("article", undefined, "message");
+    const grouped =
+      previousSender === message.sender_id &&
+      message.created_at - previousTime < 5 * 60000;
+
+    if (!grouped) {
+      const header = element("header", undefined, "message-header");
+      header.append(
+        element("strong", message.sender_name),
+        element(
+          "time",
+          date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          "muted"
+        )
+      );
+      row.append(header);
+    }
+
+    row.append(
+      element(
+        "p",
+        message.deleted ? "Message removed by teacher." : message.content,
+        message.deleted ? "muted" : "message-content"
+      )
+    );
+
+    if (message.attachment && !message.deleted) {
+      const attachment = message.attachment;
+      const url = `/api/files/${attachment.id}`;
+
+      const link = element(
+        "a",
+        `${attachment.file_name} · ${Math.ceil(attachment.size_bytes / 1024)} KB`,
+        "attachment"
+      );
+      link.href = url;
+      link.download = attachment.file_name;
+      row.append(link);
+
+      if (attachment.mime_type.startsWith("audio/")) {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "none";
+        audio.src = url;
+        row.append(audio);
+      }
+    }
+
+    if (message.sender_id === state.user.id && !message.deleted) {
+      const seen = state.roster.filter(member =>
+        member.id !== state.user.id && member.last_read_seq >= message.seq
+      ).length;
+
+      row.append(element("small", seen ? `Saved · seen by ${seen}` : "Saved", "muted"));
+    }
+
+    if (state.room.teacher_id === state.user.id && !message.deleted) {
+      row.append(button("Delete", async () => {
+        if (!confirm("Remove this message from the class?")) return;
+
+        await api(`/classes/${state.room.id}/messages/${message.id}`, {
+          method: "DELETE"
+        });
+      }, "quiet"));
+    }
+
+    container.append(row);
+    previousSender = message.sender_id;
+    previousTime = message.created_at;
+  }
+
+  if (!messages.length) {
+    container.append(element("p", "Your classroom conversation starts here.", "empty"));
+  }
+
+  if (forceBottom || nearBottom) {
+    container.scrollTop = container.scrollHeight;
+  } else {
+    container.scrollTop = previousTop;
+  }
+}
+
+function transmit(item) {
+  if (!state.ready || state.socket?.readyState !== WebSocket.OPEN) {
+    item.status = "Waiting for connection";
+    renderPending();
+    return;
+  }
+
+  item.status = "Saving…";
+  state.socket.send(JSON.stringify({
+    type: "message:new",
+    clientId: item.clientId,
+    content: item.content,
+    attachmentId: item.attachmentId
+  }));
+
+  renderPending();
+}
+
+function renderPending() {
+  const container = $("#pending");
+  container.replaceChildren();
+
+  for (const item of state.pending.values()) {
+    const row = element("div", undefined, "pending-row");
+    row.append(element(
+      "span",
+      `${item.content || "Attachment"} — ${item.status}`
+    ));
+
+    row.append(button("Retry", () => transmit(item)));
+    row.append(button("Discard", () => {
+      state.pending.delete(item.clientId);
+      renderPending();
+    }));
+
+    container.append(row);
+  }
+}
+
+$("#composer").onsubmit = event => {
+  event.preventDefault();
+
+  const content = $("#message-text").value.trim();
+  if (!content && !state.attachment) return;
+  if (state.uploading) return;
+
+  if (state.pending.size >= 10) {
+    toast("Resolve your pending messages before sending more.");
+    return;
+  }
+
+  const item = {
+    clientId: crypto.randomUUID(),
+    content,
+    attachmentId: state.attachment?.id || null,
+    status: "Waiting for connection"
+  };
+
+  state.pending.set(item.clientId, item);
+  state.attachment = null;
+  $("#message-text").value = "";
+  updateComposer();
+  transmit(item);
+};
+
+$("#message-text").addEventListener("input", () => {
+  if (
+    state.ready &&
+    state.socket?.readyState === WebSocket.OPEN &&
+    Date.now() - state.lastTyping > 3000
+  ) {
+    state.lastTyping = Date.now();
+    state.socket.send(JSON.stringify({ type: "typing" }));
+  }
+});
+
+function markRead() {
+  const container = $("#messages");
+  const nearBottom =
+    container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+
+  if (!state.ready || document.hidden || !nearBottom) return;
+
+  const seq = Math.max(0, ...[...state.messages.values()].map(message => message.seq));
+  if (!seq || seq <= state.lastRead) return;
+
+  state.lastRead = seq;
+  state.socket.send(JSON.stringify({ type: "message:read", seq }));
+}
+
+$("#messages").addEventListener("scroll", () => {
+  clearTimeout(markRead.timer);
+  markRead.timer = setTimeout(markRead, 500);
+});
+
+document.addEventListener("visibilitychange", markRead);
+
+async function uploadFile(file) {
+  if (!state.room) return;
+  if (file.size > 5 * 1024 * 1024) throw new Error("Maximum attachment size is 5 MiB.");
+
+  const generation = state.generation;
+  const classId = state.room.id;
+
+  state.uploading = true;
+  updateComposer();
+
+  try {
+    const params = new URLSearchParams({
+      class: classId,
+      name: file.name,
+      size: String(file.size)
+    });
+
+    const result = await api(`/uploads?${params}`, {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": file.type || "application/octet-stream" }
+    });
+
+    if (generation === state.generation) state.attachment = result;
+  } finally {
+    state.uploading = false;
+    updateComposer();
+  }
+}
+
+$("#file").onchange = event => run(async () => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (file) await uploadFile(file);
+});
+
+$("#cancel-attachment").onclick = () => {
+  state.attachment = null;
+  updateComposer();
+};
+
+$("#record").onclick = () => run(async () => {
+  if (state.recorder?.state === "recording") {
+    stopRecording();
+    return;
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    throw new Error("Voice recording is unavailable in this browser.");
+  }
+
+  const mime = [
+    "audio/webm;codecs=opus",
+    "audio/ogg;codecs=opus"
+  ].find(type => MediaRecorder.isTypeSupported(type));
+
+  if (!mime) throw new Error("This browser does not support a compatible audio format.");
+
+  const generation = state.generation;
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  if (generation !== state.generation) {
+    stream.getTracks().forEach(track => track.stop());
+    return;
+  }
+
+  const chunks = [];
+  let size = 0;
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType: mime,
+    audioBitsPerSecond: 32000
+  });
+
+  state.recordingStream = stream;
+  state.recorder = recorder;
+
+  recorder.ondataavailable = event => {
+    if (event.data.size) {
+      chunks.push(event.data);
+      size += event.data.size;
+      if (size > 4 * 1024 * 1024) stopRecording();
+    }
+  };
+
+  recorder.onerror = () => {
+    stopRecording(true);
+    toast("Recording failed.");
+  };
+
+  recorder.onstop = () => {
+    stream.getTracks().forEach(track => track.stop());
+    clearTimeout(state.recordingTimer);
+    $("#record").textContent = "Record voice";
+    state.recorder = null;
+
+    if (recorder.discard || generation !== state.generation) return;
+
+    run(async () => {
+      const extension = mime.includes("ogg") ? "ogg" : "webm";
+      const file = new File(chunks, `voice-${Date.now()}.${extension}`, {
+        type: mime.split(";")[0]
+      });
+      await uploadFile(file);
+    });
+  };
+
+  recorder.start(1000);
+  $("#record").textContent = "Stop recording";
+  state.recordingTimer = setTimeout(() => stopRecording(), 180000);
+});
+
+function renderRoster() {
+  const container = $("#roster");
+  container.replaceChildren();
+
+  for (const member of state.roster) {
+    const row = element("div", undefined, "roster-member");
+    const online = state.online.has(member.id);
+
+    row.append(
+      element("span", online ? "●" : "○", online ? "online" : "muted"),
+      element("strong", member.display_name),
+      element("small", member.role + (member.muted ? " · muted" : ""), "muted")
+    );
+
+    if (
+      state.room?.teacher_id === state.user.id &&
+      member.id !== state.user.id
+    ) {
+      row.append(button(member.muted ? "Unmute" : "Mute", async () => {
+        await api(`/classes/${state.room.id}/members/${member.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ muted: !member.muted })
+        });
+      }));
+
+      row.append(button("Remove", async () => {
+        if (!confirm(`Remove ${member.display_name}? The invitation code will also rotate.`)) {
+          return;
+        }
+
+        const result = await api(
+          `/classes/${state.room.id}/members/${member.id}`,
+          { method: "DELETE" }
+        );
+
+        showSecret(
+          "New invitation code",
+          "The previous code has been invalidated. Share the new code only with approved students.",
+          result.code
+        );
+      }));
+    }
+
+    container.append(row);
+  }
+}
+
+$("#rotate-invite").onclick = () => run(async () => {
+  if (!confirm("Invalidate the existing class invitation code?")) return;
+
+  const result = await post(`/classes/${state.room.id}/invite`);
+
+  showSecret(
+    "New invitation code",
+    "The previous invitation code no longer works.",
+    result.code
+  );
+});
+
+window.addEventListener("beforeunload", event => {
+  if (state.pending.size || state.recorder?.state === "recording") {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {
+    toast("Offline installation support could not be initialized.");
+  });
+}
+
+run(async () => {
+  try {
+    const result = await api("/me");
+    await enter(result.user);
+  } catch (error) {
+    if (error.status !== 401) throw error;
+  }
+});
+8. Styling
+frontend/styles.css
+CSS
+
+:root {
+  --ink: #12211d;
+  --board: #1f3a34;
+  --chalk: #f5f6f2;
+  --blue: #2f5dff;
+  --yellow: #ffc845;
+  --green: #3fae6b;
+  --line: #dce2dc;
+  --muted: #617068;
+  font-family: Arial, Helvetica, sans-serif;
+  color: var(--ink);
+  background: var(--chalk);
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+button, input, textarea { font: inherit; }
+button, .file-button { cursor: pointer; }
+button, input, textarea, .file-button { border-radius: 4px; }
+button {
+  padding: .65rem .85rem;
+  border: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+}
+button:hover { border-color: var(--board); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--blue); color: white; border-color: var(--blue); }
+button.quiet { border: 0; background: transparent; font-size: .75rem; }
+:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
+input, textarea {
+  width: 100%;
+  padding: .8rem;
+  border: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+}
+textarea { resize: vertical; }
+label { display: grid; gap: .5rem; font-size: .9rem; }
+a { color: var(--blue); }
+h1, h2, p { margin-top: 0; }
+h1 { letter-spacing: -.045em; }
+h2 { font-size: 1.15rem; }
+.muted { color: var(--muted); font-size: .85rem; }
+.eyebrow {
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .15em;
+}
+.auth { max-width: 1000px; margin: 6vh auto; padding: 1rem; }
+.auth > header {
+  padding: 3rem;
+  background: var(--board);
+  color: var(--chalk);
+  border-left: 6px solid var(--blue);
+}
+.auth header .eyebrow { color: var(--yellow); }
+.auth h1 { font-size: clamp(2rem, 7vw, 4rem); margin: 1rem 0; }
+.auth-grid { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); }
+.auth form { display: grid; gap: 1rem; padding: 2rem; align-content: start; }
+.auth form + form { border-left: 1px solid var(--line); }
+.workspace {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr) 280px;
+  height: 100dvh;
+}
+.rail {
+  background: var(--board);
+  color: var(--chalk);
+  padding: 1.5rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  overflow: auto;
+}
+.brand { font-size: 1.45rem; font-weight: 800; letter-spacing: -.05em; }
+.brand span { color: var(--yellow); }
+#identity { font-size: .85rem; opacity: .8; }
+.rail-actions { display: grid; gap: .5rem; margin-bottom: 1.5rem; }
+.rail .eyebrow { color: #b3c4bd; }
+#class-list { display: grid; gap: .3rem; }
+.class-tab {
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: white;
+  border-radius: 0;
+  border-left: 3px solid transparent;
+}
+.class-tab.selected { background: #ffffff12; border-left-color: var(--yellow); }
+.rail-bottom { margin-top: auto; font-size: .75rem; color: #b3c4bd; }
+.conversation {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.room-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.4rem 1.8rem;
+  border-bottom: 1px solid var(--line);
+}
+.room-header h1 { margin: .35rem 0 0; font-size: 1.6rem; }
+#connection { font-size: .75rem; color: var(--muted); text-align: right; }
+.transcript-controls { padding: .6rem 1.8rem 0; }
+.transcript-controls button { font-size: .75rem; }
+.messages { overflow: auto; flex: 1; padding: 1rem 1.8rem; }
+.day-rule {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-size: .7rem;
+  color: var(--muted);
+  margin: 1rem 0 1.5rem;
+}
+.day-rule::after { content: ""; height: 1px; background: var(--line); flex: 1; }
+.message { padding: .3rem 0 .6rem; overflow-wrap: anywhere; }
+.message-header { display: flex; gap: .75rem; align-items: baseline; margin-bottom: .35rem; }
+.message-header strong { font-size: .9rem; }
+.message-header time { font-size: .7rem; }
+.message p { margin-bottom: .4rem; line-height: 1.5; }
+.message-content { white-space: pre-wrap; }
+.message audio { display: block; max-width: 100%; margin: .5rem 0; }
+.attachment {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  padding: .75rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  text-decoration: none;
+  margin: .4rem 0;
+  font-size: .85rem;
+}
+.typing { padding: 0 1.8rem; min-height: 1.2rem; font-size: .75rem; color: var(--muted); }
+.composer { margin: .65rem 1.5rem 1.5rem; border: 1px solid var(--line); background: white; border-radius: 10px; }
+.composer textarea { border: 0; min-height: 75px; resize: none; border-radius: 10px; }
+.composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .6rem; }
+.composer-toolbar button { font-size: .8rem; }
+#send { margin-left: auto; }
+#attachment-label { padding: 0 .8rem; }
+.file-button { display: inline-block; border: 1px solid var(--line); padding: .65rem .85rem; font-size: .8rem; }
+.file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.file-button:focus-within { outline: 3px solid var(--yellow); }
+.context { border-left: 1px solid var(--line); padding: 1.5rem; overflow: auto; }
+.roster-member {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  align-items: center;
+  padding: .9rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.roster-member strong { font-size: .85rem; }
+.roster-member small { width: 100%; padding-left: 1rem; }
+.roster-member button { font-size: .7rem; padding: .35rem .5rem; }
+.online { color: var(--green); }
+.notice { margin-top: 2rem; padding: 1rem; background: #e9ede7; font-size: .8rem; line-height: 1.5; }
+.notice p { margin: .5rem 0 0; }
+.empty { padding: 2rem 0; color: var(--muted); }
+.pending { padding: 0 1.5rem; max-height: 130px; overflow: auto; }
+.pending-row { display: flex; gap: .5rem; align-items: center; padding: .4rem; background: #fff2c9; font-size: .8rem; }
+.pending-row span { flex: 1; overflow-wrap: anywhere; }
+.pending-row button { padding: .3rem; font-size: .7rem; }
+dialog { border: 1px solid var(--line); border-radius: 10px; max-width: 520px; width: calc(100% - 2rem); padding: 2rem; }
+dialog::backdrop { background: #12211dbb; }
+dialog textarea { margin-bottom: 1rem; overflow-wrap: anywhere; }
+#toast {
+  position: fixed;
+  bottom: 1.2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink);
+  color: white;
+  padding: 1rem 1.3rem;
+  border-radius: 6px;
+  max-width: min(600px, 92vw);
+  z-index: 100;
+}
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+@media (max-width: 1100px) {
+  .workspace { grid-template-columns: 210px minmax(0, 1fr); }
+  .context { display: none; }
+}
+
+@media (max-width: 700px) {
+  .auth { margin: 0; padding: 0; }
+  .auth > header { padding: 2rem; }
+  .auth-grid { grid-template-columns: 1fr; }
+  .auth form + form { border-left: 0; border-top: 1px solid var(--line); }
+  .workspace { display: flex; flex-direction: column; height: auto; min-height: 100dvh; }
+  .rail { padding: 1rem; gap: .5rem; overflow: visible; }
+  .rail .brand { font-size: 1.2rem; }
+  .rail #identity { margin-bottom: .25rem; }
+  .rail-actions { display: flex; margin: 0; flex-wrap: wrap; }
+  .rail-actions button, #logout { padding: .45rem; font-size: .75rem; }
+  .rail > .eyebrow, .rail-bottom p { display: none; }
+  #class-list { display: flex; overflow-x: auto; }
+  .class-tab { flex-shrink: 0; }
+  .rail-bottom { margin: 0; position: absolute; right: 1rem; top: 1rem; }
+  .conversation { height: 78dvh; min-height: 450px; }
+  .room-header { padding: 1rem; }
+  .room-header h1 { font-size: 1.3rem; }
+  .messages { padding: .75rem 1rem; }
+  .composer { margin: .5rem; }
+  .typing { padding: 0 1rem; }
+  .context { display: block; border-left: 0; border-top: 1px solid var(--line); }
+  .transcript-controls { padding-left: 1rem; }
+}
+9. PWA shell
+frontend/sw.js
+Only public application assets are cached. Class messages, sessions and attachments are not cached by the service worker.
+
+JavaScript
+
+const CACHE = "classconnect-shell-v1";
+
+const SHELL = [
+  "/",
+  "/index.html",
+  "/app.js",
+  "/styles.css",
+  "/manifest.webmanifest",
+  "/icons/icon-192.png",
+  "/icons/icon-512.png"
+];
+
+self.addEventListener("install", event => {
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));
+});
+
+self.addEventListener("activate", event => {
+  event.waitUntil((async () => {
+    const names = await caches.keys();
+
+    await Promise.all(
+      names
+        .filter(name => name.startsWith("classconnect-shell-") && name !== CACHE)
+        .map(name => caches.delete(name))
+    );
+
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener("fetch", event => {
+  const request = event.request;
+  const url = new URL(request.url);
+
+  if (
+    request.method !== "GET" ||
+    url.origin !== self.location.origin ||
+    url.pathname.startsWith("/api/") ||
+    url.pathname.startsWith("/ws/")
+  ) {
+    return;
+  }
+
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request).catch(() => caches.match("/index.html"))
+    );
+    return;
+  }
+
+  if (SHELL.includes(url.pathname)) {
+    event.respondWith(
+      caches.match(request).then(cached => cached || fetch(request))
+    );
+  }
+});
+Increment CACHE when deploying changed shell assets.
+
+frontend/manifest.webmanifest
+JSON
+
+{
+  "id": "/",
+  "name": "ClassConnect",
+  "short_name": "ClassConnect",
+  "description": "Private classroom communication",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F5F6F2",
+  "theme_color": "#1F3A34",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
+scripts/make-icons.py
+Generates actual PNG icons without third-party Python dependencies.
+
+Python
+
+from pathlib import Path
+import struct
+import zlib
+
+output = Path(__file__).resolve().parents[1] / "frontend" / "icons"
+output.mkdir(parents=True, exist_ok=True)
+
+def chunk(kind, data):
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    )
+
+def write_icon(size):
+    rows = bytearray()
+
+    for y in range(size):
+        rows.append(0)
+
+        for x in range(size):
+            color = (31, 58, 52)
+            nx, ny = x / size, y / size
+
+            # A simple classroom-plaque C mark.
+            outer = 0.23 < nx < 0.77 and 0.23 < ny < 0.77
+            inner = 0.36 < nx < 0.78 and 0.36 < ny < 0.64
+
+            if outer and not inner:
+                color = (245, 246, 242)
+
+            if 0.70 < nx < 0.80 and 0.69 < ny < 0.79:
+                color = (255, 200, 69)
+
+            rows.extend(color)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+    png += chunk(b"IEND", b"")
+
+    (output / f"icon-{size}.png").write_bytes(png)
+
+for size in (192, 512):
+    write_icon(size)
+
+print("Generated PWA icons.")
+10. Secure teacher provisioning
+scripts/provision-teacher.mjs
+Teacher accounts are created by someone with database deployment access—not through the browser.
+
+JavaScript
+
+import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
+
+const name = process.argv.slice(2).join(" ").trim() || "Class Teacher";
+
+if (name.length > 60) {
+  throw new Error("Teacher name must be at most 60 characters.");
+}
+
+const id = randomUUID();
+const key = randomBytes(32).toString("hex");
+const keyHash = createHash("sha256").update(key).digest("hex");
+
+function sql(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+const statement = `
+INSERT INTO users(id, display_name, role, recovery_hash, created_at)
+VALUES (
+  ${sql(id)},
+  ${sql(name)},
+  'teacher',
+  ${sql(keyHash)},
+  ${Date.now()}
+);
+`;
+
+writeFileSync("teacher-seed.sql", statement, { mode: 0o600 });
+writeFileSync(
+  "teacher-credentials.txt",
+  `Teacher: ${name}\nUser ID: ${id}\nRecovery key: ${key}\n`,
+  { mode: 0o600 }
+);
+
+console.log(`
+Created:
+  teacher-seed.sql
+  teacher-credentials.txt
+
+Apply teacher-seed.sql to D1, then remove the SQL file.
+Store teacher-credentials.txt in a password manager and delete the local copy.
+Never commit either file.
+`);
+The recovery key is a randomly generated 256-bit secret, so a fast cryptographic hash is appropriate here. This is not a human password stored with an insufficient password hash.
+
+11. Basic automated tests
+backend/test/validation.test.js
+JavaScript
+
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  cleanText,
+  normalizeInvite,
+  allowedMime
+} from "../src/index.js";
+
+test("trims valid display names", () => {
+  assert.equal(cleanText("  Priya  ", 1, 60, "Name"), "Priya");
+});
+
+test("rejects empty names", () => {
+  assert.throws(() => cleanText("   ", 1, 60, "Name"));
+});
+
+test("rejects oversized messages", () => {
+  assert.throws(() => cleanText("x".repeat(4001), 0, 4000, "Message"));
+});
+
+test("normalizes invitation codes", () => {
+  assert.equal(normalizeInvite("abcd-efgh"), "ABCDEFGH");
+});
+
+test("accepts supported MediaRecorder MIME parameters", () => {
+  assert.equal(allowedMime("audio/webm;codecs=opus"), "audio/webm");
+});
+
+test("rejects active document types", () => {
+  assert.throws(() => allowedMime("text/html"));
+  assert.throws(() => allowedMime("image/svg+xml"));
+  assert.throws(() => allowedMime("application/javascript"));
+});
+These are validation tests, not a replacement for Worker/DO integration tests or Android device testing.
+
+12. Deployment workflow
+.github/workflows/deploy.yml
+Deployment is manual initially, preventing an accidental production deployment on every push.
+
+YAML
+
+name: Deploy ClassConnect
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: classconnect-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run icons
+      - run: npm run db:remote
+      - run: npm run deploy:api
+      - run: npm run deploy:web
+Use a least-privilege Cloudflare API token scoped to this account’s Workers, Pages, D1 and required storage operations.
+
+13. First deployment
+From the project root:
+
+Bash
+
+npm install
+npm run icons
+npm test
+
+npx wrangler login
+
+npx wrangler d1 create classconnect-db
+npx wrangler r2 bucket create classconnect-files
+npx wrangler pages project create classconnect --production-branch main
+If the Pages project name is unavailable, choose another and update:
+
+frontend/wrangler.toml
+package.json → deploy:web
+backend/wrangler.toml → APP_ORIGIN
+Put the D1 database ID into backend/wrangler.toml.
+
+Apply the schema:
+
+Bash
+
+npm run db:remote
+Provision the teacher:
+
+Bash
+
+npm run teacher -- "Ms. Rahman"
+
+npx wrangler d1 execute classconnect-db \
+  --remote \
+  --config backend/wrangler.toml \
+  --file teacher-seed.sql
+Store the generated recovery key privately, then delete the temporary provisioning files.
+
+Deploy:
+
+Bash
+
+npm run deploy:api
+npm run deploy:web
+In the Cloudflare dashboard, confirm that the Pages production environment has the service binding:
+
+text
+
+Binding name: API
+Service: classconnect-api
+The Wrangler configuration is intended to set this binding; checking it after the initial deployment avoids a confusing first-run failure.
+
+Then:
+
+Open your Pages URL.
+Sign in using the provisioned teacher recovery key.
+Create a class.
+Save the invitation code.
+Open a separate browser profile or Android device.
+Enroll a student.
+Save the student’s recovery key.
+Test messages, voice notes and moderation.
+14. Free-tier and privacy boundaries
+The application currently enforces:
+
+Control	Limit
+Class membership	40 students + teacher
+Live sockets per class	82
+Live sockets per account per class	2
+Message length	4,000 characters
+WebSocket events per user per class	90/minute
+Attachment size	5 MiB
+Uploads per user	10/day
+Upload bytes per user	20 MiB/day
+Upload bytes across installation	50 MiB/day
+Lifetime accepted upload reservations	512 MiB
+Message and attachment retention	30 days
+Voice recording	3 minutes
+Session lifetime	7 days
+The 512 MiB lifetime upload reservation cap does not automatically reset, even when old files are deleted. That conservative behavior is intentional: uploads stop instead of assuming additional spending is acceptable.
+
+These controls reduce risk, but they are not a provider-level billing cap. In particular:
+
+R2 billing conditions must be checked in your account.
+Large numbers of rejected or malicious requests still consume infrastructure resources.
+Other applications in the same Cloudflare account may share allowances.
+Budget alerts should not be mistaken for automatic hard spending stops.
+No September 2026 pricing claim from the PDF has been treated as verified here.
+Before using real student data
+Run integration and device tests, including:
+
+Failed D1 write → no successful acknowledgement.
+Repeated clientId → only one saved message.
+Removed member → socket closed and REST access denied.
+Rotated invitation → previous code rejected.
+Forged MIME or oversized upload → rejected.
+Logout → subsequent persistent socket operations rejected.
+Network reconnect → saved messages reconciled.
+Android microphone permission denied → recoverable UI.
+Pages service binding → cookie and WebSocket authentication work on the actual production hostname.
+This is a concrete v1 source implementation. It is not yet a verified production release, and it does not claim to implement the deferred calling or push features.
