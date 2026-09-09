@@ -1,0 +1,19 @@
+{
+  "name": "classconnect",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test backend/test/*.test.js",
+    "icons": "python3 scripts/make-icons.py",
+    "teacher": "node scripts/provision-teacher.mjs",
+    "db:local": "wrangler d1 migrations apply classconnect-db --local --config backend/wrangler.toml",
+    "db:remote": "wrangler d1 migrations apply classconnect-db --remote --config backend/wrangler.toml",
+    "dev:api": "wrangler dev --config backend/wrangler.toml",
+    "dev:web": "wrangler pages dev frontend --port 8788 --service API=classconnect-api",
+    "deploy:api": "wrangler deploy --config backend/wrangler.toml",
+    "deploy:web": "wrangler pages deploy frontend --project-name classconnect"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

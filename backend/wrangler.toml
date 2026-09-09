@@ -1,0 +1,35 @@
+name = "classconnect-api"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+
+# Reach the API through the Pages service binding, not a public workers.dev URL.
+workers_dev = false
+preview_urls = false
+
+[vars]
+APP_ORIGIN = "https://classconnect.pages.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "classconnect-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "classconnect-files"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "ClassRoom"
+
+[[durable_objects.bindings]]
+name = "GUARD"
+class_name = "BudgetGuard"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClassRoom", "BudgetGuard"]
+
+[triggers]
+crons = ["17 3 * * *"]
