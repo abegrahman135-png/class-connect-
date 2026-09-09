@@ -96,7 +96,7 @@ The GitHub Actions workflow `.github/workflows/deploy.yml` does the same manuall
 
 **Remaining work before real student data:**
 
-- Integration + device tests, including: failed D1 write → no false acknowledgement; repeated `clientId` → one saved message; removed member → socket closed and REST denied; rotated invitation → old code rejected; forged MIME / oversized uploads → rejected; logout → later socket operations rejected; reconnect → saved messages reconciled; Android microphone permission denied → recoverable UI
+- WebSocket + device tests (HTTP API flows are covered by `npm test`), including: failed D1 write → no false acknowledgement; repeated `clientId` → one saved message; removed member → socket closed; logout → later socket operations rejected; reconnect → saved messages reconciled; Android microphone permission denied → recoverable UI
 - Verify the Pages service binding (cookie + WebSocket auth) on the actual production hostname
 - Check R2 billing conditions in your account; budget alerts are not automatic hard spending stops
 - No antivirus scanning: PDFs and attachments must still be treated as untrusted files
